@@ -30,7 +30,24 @@ MAX_OBSERVATION_CHARS = 10_000
 # TODO(Part 2): Write instructions that make the model produce concise working
 # memory for a software agent. The prompt should preserve concrete progress,
 # failures, test results, constraints, and next steps without copying raw output.
-COMPACTION_SYSTEM_PROMPT = ""
+COMPACTION_SYSTEM_PROMPT = """
+You are a software agent that has been working on a task. 
+Your goal is to summarize the context of your work so far into concise working memory. 
+Please preserve the following information in your summary:
+- The objective of the task
+- Any constraints or requirements that have been specified
+- Important decisions or actions that have been taken
+- Record completed work, files changed and commands executed
+- Record test results and any failures or blockers encountered
+- The next steps or actions that need to be taken
+- Preserve exact filenames, function names, relevant commands,
+  and specific test outcomes.
+- Do not invent information. Use empty lists or null for
+  information that is unavailable.
+Please avoid including raw output or irrelevant details.
+
+Return a concise plain-text working-memory summary instead.
+"""
 
 
 class StepLimitError(Exception):
@@ -309,10 +326,23 @@ class Agent:
         # messages verbatim and at least the latest complete assistant action
         # with all linked tool observations. The resulting summary should change
         # what `build_prompt` emits, and reduce the length of the prompt.
-
-        raise NotImplementedError
-
-        compaction_prompt = []
+        assistant_indices = [
+            i
+            for i, message in enumerate(self.conversation_history)
+            if message.get("role") == "assistant"
+        ]
+        if len(assistant_indices) <= self.compaction_keep_recent_steps:
+            return {}, {}
+        boundary = assistant_indices[-self.compaction_keep_recent_steps]
+        messages_to_compact = self.conversation_history[:boundary]
+        recent_messages = self.conversation_history[boundary:]
+        compaction_prompt = [
+            {
+                "role": "system",
+                "content": self.task_prompt + COMPACTION_SYSTEM_PROMPT,
+            },
+            {"role": "user", "content": json.dumps(messages_to_compact)},
+        ]
 
         ### Do not modify this section ###
         compaction_response = self.client.chat.completions.create(
@@ -322,6 +352,15 @@ class Agent:
             max_completion_tokens=self.compaction_max_tokens,
         )
         ##################################
+        working_memory_text = compaction_response.choices[0].message.content
+        print("DEBUG finish_reason:", compaction_response.choices[0].finish_reason)
+        print("DEBUG message:", compaction_response.choices[0].message.model_dump())
+        if not working_memory_text or not working_memory_text.strip():
+            raise ValueError("Compaction response is empty")
+
+        self.conversation_history = [
+            {"role": "assistant", "content": working_memory_text.strip()}
+        ] + recent_messages
 
         # Use `compaction_response` to update what `build_prompt` emits, but
         # DO NOT modify the object itself. Let the method return it unchanged.
@@ -351,6 +390,8 @@ class Agent:
             return False
 
         compaction_prompt, compaction_response = self.compact_context()
+        if not compaction_prompt or not compaction_response:
+            return False
         prompt_after = deepcopy(self.build_prompt())
         self.compaction_events.append(
             {
@@ -380,8 +421,7 @@ class Agent:
                     raise StepLimitError(
                         f"step limit {self.step_limit} reached; agent did not finish"
                     )
-                if self.maybe_compact_context():
-                    self.compact_context()
+                self.maybe_compact_context()
 
                 assistant_response = self.query_language_model()
                 self.conversation_history.append(assistant_response)
