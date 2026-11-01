@@ -52,7 +52,44 @@ def _simulate_move(client: httpx.Client, arguments: str) -> str:
     # JSON arguments, arguments that are not an object, a missing or
     # non-string fen, a non-string move, a position or move the server rejects,
     # and a transport failure.
-    raise NotImplementedError
+
+    try:
+        args = json.loads(arguments)
+
+        if not isinstance(args, dict):
+            return "<chess_error>Arguments must be a JSON object.</chess_error>"
+
+        fen = args.get("fen")
+
+        if not isinstance(fen, str):
+            return (
+                "<chess_error>Missing or invalid fen. Expected a string.</chess_error>"
+            )
+
+        payload = {"fen": fen}
+
+        if args.get("move") is not None:
+            if not isinstance(args["move"], str):
+                return (
+                    "<chess_error>Invalid move format. Expected a string.</chess_error>"
+                )
+
+            payload["move"] = args["move"]
+
+        result = _request_state(
+            client,
+            "POST",
+            "/api/simulate",
+            json=payload,
+        )
+
+        return json.dumps(result)
+
+    except (json.JSONDecodeError, TypeError):
+        return "<chess_error>Arguments must be valid JSON.</chess_error>"
+
+    except (ValueError, RuntimeError, httpx.RequestError) as exc:
+        return f"<chess_error>{exc}</chess_error>"
 
 
 def _play_move(client: httpx.Client, arguments: str) -> str:
@@ -67,7 +104,27 @@ def _play_move(client: httpx.Client, arguments: str) -> str:
     # for the agent to address. Cover malformed JSON arguments, arguments
     # that are not an object, a missing or non-string fen, a non-string move,
     # a position or move the server rejects, and a transport failure.
-    raise NotImplementedError
+
+    try:
+        args = json.loads(arguments)
+
+        if not isinstance(args, dict):
+            return "<chess_error>Arguments must be a JSON object.</chess_error>"
+
+        if not isinstance(args.get("move"), str):
+            return "<chess_error>Invalid move format.</chess_error>"
+
+        method, endpoint = "POST", "/api/move"
+
+        result = _request_state(client, method, endpoint, json={"move": args["move"]})
+
+        return json.dumps(result)
+
+    except json.JSONDecodeError:
+        return "<chess_error>Arguments must be valid JSON.</chess_error>"
+
+    except (ValueError, RuntimeError, httpx.RequestError) as exc:
+        return f"<chess_error>{exc}</chess_error>"
 
 
 def _run_python(env: Any, port: int, arguments: str) -> str:
@@ -76,7 +133,57 @@ def _run_python(env: Any, port: int, arguments: str) -> str:
     The snippet runs inside the sandbox, which already has the tool
     implementations and the chess server, so code the model wrote never
     executes in the agent process.
+
     """
+
+    try:
+        # 1. Parse tool arguments.
+        args = json.loads(arguments)
+
+        if not isinstance(args, dict):
+            return "<chess_error>Arguments must be a JSON object.</chess_error>"
+
+        # 2. Validate code.
+        code = args.get("code")
+
+        if not isinstance(code, str):
+            return (
+                "<chess_error>Missing or invalid code. Expected a string.</chess_error>"
+            )
+
+        # 3. Encode code to Base64.
+        encoded_code = base64.b64encode(code.encode("utf-8")).decode("ascii")
+
+        # 4. Execute inside the remote sandbox.
+        command = [
+            "python",
+            "/opt/assignment/sandbox_python.py",
+            str(port),
+            encoded_code,
+        ]
+
+        result = env.execute(command, shell=False)
+
+        # 5. Check whether the sandbox runner itself failed.
+        exception_info = result.get("exception_info", "")
+        stderr = result.get("stderr", "")
+        returncode = result.get("returncode", -1)
+
+        if exception_info:
+            return f"<chess_error>{exception_info}</chess_error>"
+
+        if returncode != 0:
+            message = stderr or "Sandbox execution failed."
+            return f"<chess_error>{message}</chess_error>"
+
+        # Return the runner's JSON output unchanged.
+        return result.get("stdout", "")
+
+    except json.JSONDecodeError:
+        return "<chess_error>Arguments must be valid JSON.</chess_error>"
+
+    except (TypeError, ValueError, RuntimeError) as exc:
+        return f"<chess_error>{exc}</chess_error>"
     # TODO(3.4): parse the arguments and run the code in the
     # sandbox with the registered tools available by name.
     #
@@ -95,15 +202,43 @@ def _run_python(env: Any, port: int, arguments: str) -> str:
     #
     # Return <chess_error>{message}</chess_error> if there are issues like type
     # mismatches or parsing failures.
-    raise NotImplementedError
 
 
-def _invoke_skill(skills: dict[str, dict[str, str]], arguments: str) -> str:
-    """Existing tool: load one skill's instructions into the conversation."""
-    # TODO(3.5): parse the arguments and return the named skill's content.
-    # Return <chess_error>{message}</chess_error> if there are issues like type
-    # mismatches or parsing failures.
-    raise NotImplementedError
+def _invoke_skill(
+    skills: dict[str, dict[str, str]],
+    arguments: str,
+) -> str:
+    """Load one skill's full instructions."""
+
+    try:
+        # Parse JSON arguments.
+        args = json.loads(arguments)
+
+        if not isinstance(args, dict):
+            return "<chess_error>Arguments must be a JSON object.</chess_error>"
+
+        # Extract skill name.
+        name = args.get("name")
+
+        if not isinstance(name, str) or not name.strip():
+            return "<chess_error>Missing or invalid skill name.</chess_error>"
+
+        # Check whether the requested skill exists.
+        skill = skills.get(name)
+
+        if not isinstance(skill, dict):
+            return f"<chess_error>Unknown skill: {name}</chess_error>"
+
+        # Retrieve complete skill instructions.
+        content = skill.get("content")
+
+        if not isinstance(content, str):
+            return f"<chess_error>Skill '{name}' has invalid content.</chess_error>"
+
+        return content
+
+    except json.JSONDecodeError:
+        return "<chess_error>Arguments must be valid JSON.</chess_error>"
 
 
 def _game_state(client: httpx.Client, reset: bool = False) -> dict:

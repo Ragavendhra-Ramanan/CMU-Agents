@@ -133,10 +133,78 @@ INVOKE_SKILL_TOOL = {
 # TODO(3.1.a): Define an OpenAI function-tool schema named ``play_move``.
 # It must accept exactly one required string argument named ``move``, explain
 # that moves use UCI notation (for example e2e4), and reject extra arguments.
-PLAY_MOVE_TOOL: dict = {}
+PLAY_MOVE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "play_move",
+        "description": "Play a move in the chess game.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "move": {
+                    "type": "string",
+                    "description": "The move to play in UCI notation (e.g., e2e4).",
+                }
+            },
+            "required": ["move"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # TODO(3.3): Define the `simulate_move` tool, like the `play_move` tool.
-SIMULATE_MOVE_TOOL: dict = {}
+
+SIMULATE_MOVE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "simulate_move",
+        "description": (
+            "Simulate a chess position or a hypothetical UCI move without "
+            "changing the actual game. Provide a complete six-field FEN. "
+            "Optionally provide a UCI move such as e2e4 or e7e8q."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fen": {
+                    "type": "string",
+                    "description": "Complete six-field FEN describing the chess position.",
+                },
+                "move": {
+                    "type": ["string", "null"],
+                    "description": "Optional UCI move to simulate, such as e2e4.",
+                },
+            },
+            "required": ["fen", "move"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+}
+
 
 # TODO()
-RUN_PYTHON_TOOL: dict = {}
+RUN_PYTHON_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "run_python",
+        "description": (
+            "Execute Python code in the sandbox. "
+            "The code can call simulate_move and play_move "
+            "as synchronous functions."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute in the sandbox.",
+                },
+            },
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+    },
+}

@@ -107,6 +107,7 @@ class ChessAgent(Agent):
         )
 
         # TODO(Part 3): Register the play_move tool schema from tools.py.
+        self.tools.extend([PLAY_MOVE_TOOL, SIMULATE_MOVE_TOOL])
 
         if programmatic_tools:
             self.tools.append(RUN_PYTHON_TOOL)
@@ -161,20 +162,124 @@ class ChessAgent(Agent):
     def execute_tool_calls(
         self, tool_calls: list[dict[str, Any]]
     ) -> list[dict[str, str]]:
-        """Execute model-generated ``play_move`` calls against the chess API."""
+        """Execute model-generated chess tool calls."""
 
-        # TODO(Part 3.1):
-        # 1. Dispatch on the function name, and ignore a tool this agent did
-        #    not register.
-        # 2. Hand the raw arguments to the matching chess_tools helper, with
-        #    self.chess_client as its first argument. Each helper takes the
-        #    client explicitly so the same code can run inside the sandbox.
-        # 3. Format a played move with self.format_state, then update
-        #    last_state and finished.
-        # 4. Link every observation to its call with tool_call_id.
-        # 5. Turn malformed, unknown, rejected, or extra parallel calls into
-        #    recoverable <chess_error> observations instead of crashing.
+        observations = []
 
-        # TODO(Part 3.3-4): add cases for simulate_move and run_python, with
-        # linked observations and recoverable errors, just like the old tool.
-        raise NotImplementedError
+        # Allow exactly one tool call per model response.
+        if len(tool_calls) != 1:
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+
+                call_id = tool_call.get("id")
+                if not isinstance(call_id, str):
+                    continue
+
+                observations.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": (
+                            "<chess_error>Only one tool call is allowed per response. "
+                            "Please retry with a single tool call.</chess_error>"
+                        ),
+                    }
+                )
+
+            return observations
+
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+
+            call_id = tool_call.get("id")
+            if not isinstance(call_id, str):
+                continue
+
+            function = tool_call.get("function")
+
+            if not isinstance(function, dict):
+                content = (
+                    "<chess_error>Missing or invalid function object.</chess_error>"
+                )
+
+            else:
+                tool_name = function.get("name")
+                arguments = function.get("arguments")
+
+                if not isinstance(arguments, str):
+                    content = "<chess_error>Tool arguments must be a JSON string.</chess_error>"
+
+                elif tool_name == "play_move":
+                    try:
+                        result = _play_move(self.chess_client, arguments)
+
+                        if result.startswith("<chess_error>"):
+                            content = result
+                        else:
+                            new_state = json.loads(result)
+
+                            if not isinstance(new_state, dict):
+                                raise ValueError("Invalid chess state response.")
+
+                            self.last_state = new_state
+                            self.finished = bool(new_state.get("game_over"))
+
+                            content = self.format_state(new_state)
+
+                    except (
+                        json.JSONDecodeError,
+                        ValueError,
+                        TypeError,
+                        RuntimeError,
+                    ) as exc:
+                        content = f"<chess_error>Chess move execution failed: {exc}</chess_error>"
+
+                elif tool_name == "simulate_move":
+                    # Simulation does not change the live game.
+                    content = _simulate_move(
+                        self.chess_client,
+                        arguments,
+                    )
+                elif tool_name == "invoke_skill":
+                    content = _invoke_skill(self.skills, arguments)
+                elif tool_name == "run_python":
+                    try:
+                        result = _run_python(
+                            self.env,
+                            self.python_sandbox_port,
+                            arguments,
+                        )
+                    except (ValueError, TypeError, RuntimeError) as exc:
+                        result = (
+                            f"<chess_error>Python execution failed: {exc}</chess_error>"
+                        )
+
+                    # Refresh even if the Python snippet failed.
+                    try:
+                        new_state = _game_state(self.chess_client)
+
+                        self.last_state = new_state
+                        self.finished = bool(new_state.get("game_over"))
+
+                        content = f"{result}\n\n{self.format_state(new_state)}"
+
+                    except (ValueError, TypeError, RuntimeError) as exc:
+                        content = (
+                            f"{result}\n"
+                            f"<chess_error>Failed to refresh chess state: {exc}</chess_error>"
+                        )
+
+                else:
+                    content = f"<chess_error>Unknown tool: {tool_name}</chess_error>"
+
+            observations.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": content,
+                }
+            )
+
+        return observations
