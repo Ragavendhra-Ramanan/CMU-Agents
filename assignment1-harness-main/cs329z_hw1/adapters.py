@@ -28,7 +28,8 @@ of this call.
 from __future__ import annotations
 
 from typing import Any, Callable, Optional
-
+import json
+import re
 from cs329z_hw1.types import (
     AgentConfig,
     DocWindow,
@@ -61,7 +62,319 @@ def run_priority(email: Email, lm: LMCallable) -> dict:
     * The function does not raise and does not modify ``email``.
     * Live: at least 85% agreement with tests/fixtures/priority_gold.json.
     """
-    raise NotImplementedError
+    system_prompt = """
+You are a precise email priority classification system.
+
+Your task is to classify emails into exactly one of three categories:
+urgent, normal, or ignore.
+
+Always judge emails from the perspective of the recipient
+at the time the email was sent.
+
+Consider the sender, recipient, subject, date, and body together.
+Classify based on what the recipient should do with the message,
+not how important the topic is to the company.
+
+==================================================
+1. URGENT
+==================================================
+
+An email is urgent when the recipient needs to take action
+or resolve a problem within a short time.
+
+TWO CONDITIONS MUST BE SATISFIED:
+
+A. RECIPIENT RESPONSIBILITY
+
+At least one of the following must be true:
+
+- The email explicitly asks the recipient to do something.
+- The email clearly assigns the recipient responsibility
+  for resolving a live problem.
+- The email reports an ongoing issue that the recipient
+  is expected to address.
+
+A request directed to another person does not qualify.
+A discussion of an important business matter does not
+automatically mean the recipient must act.
+
+B. TIME PRESSURE
+
+The required action must be needed:
+
+- The same day the email was sent.
+- The next working day.
+- By a stated deadline no more than two working days away.
+- Immediately because the context clearly establishes
+  that delaying action would cause a problem.
+
+A deadline may be explicit or clearly implied by context.
+
+IMPORTANT DISTINCTIONS:
+
+- An event happening tomorrow does not automatically
+  make an email urgent. The recipient's action must be
+  required before or during that event.
+
+- A future event mentioned as context is not necessarily
+  a deadline.
+
+- A status update about an upcoming negotiation, meeting,
+  transaction, or business event is normally normal unless
+  it explicitly requires the recipient to act within
+  two working days.
+
+- A request without a deadline and without a clearly
+  implied immediate need is normally normal.
+
+- "Effective immediately" and "from now on" often describe
+  a change in procedure, contact details, or preference.
+  They do not automatically create an urgent task.
+
+- A live problem must be something the recipient is
+  expected to address, not merely information about
+  a problem.
+
+- Not every request within two working days is urgent.
+  The recipient must have responsibility for the action.
+
+Examples:
+
+Urgent:
+"The bank rejected this morning's wire. I need you to
+approve the corrected one by 1 PM today."
+
+Urgent:
+"The customer's CFO is threatening to cancel.
+Can you call him before 4 PM today?"
+
+Normal:
+"The negotiation is tomorrow. Here is the latest
+update on the sale."
+
+Normal:
+"Please use my new email address effective immediately."
+
+Normal:
+"Can you call David Marshall and get his email?
+I need to contact him about a matter."
+Unless the context establishes a near-term deadline.
+
+==================================================
+2. NORMAL
+==================================================
+
+Normal includes legitimate work or personal communication
+written for this recipient or a small working group,
+when there is no required action with a deadline within
+the next two working days.
+
+This includes:
+
+- Status updates and FYIs.
+- Ordinary questions.
+- Documents sent for review without a near deadline.
+- Meeting scheduling for later dates.
+- Replies in ongoing discussions.
+- Routine administrative instructions.
+- Changes to contact details or working preferences.
+- Business updates about important transactions or events.
+- Requests without a clearly established near-term deadline.
+- Personal notes from friends or family.
+- Short personal or social messages.
+
+Examples:
+
+"Attached is the draft term sheet. Let me know if you
+have comments before our meeting the week after next."
+
+"Thanks for lunch yesterday. Are you still coming
+to the lake in August?"
+
+"We have 24 people now, not 22. Can we get two more
+desks? The seating chart is coming Thursday."
+
+This last example is normal unless the email clearly
+establishes that the desks must be arranged within
+the next two working days.
+
+==================================================
+3. IGNORE
+==================================================
+
+Ignore includes messages the recipient can leave unread
+without missing a personal or work responsibility.
+
+This includes:
+
+- Advertising and spam from vendors.
+- Newsletters and news digests.
+- Announcements sent to large employee lists.
+- Announcements about events, training offerings,
+  and general facilities notices.
+- Automated notifications that do not require the
+  recipient to do anything.
+
+Examples:
+
+"This week only: 40% off all standing desks.
+Reply REMOVE to unsubscribe."
+
+"To all employees: the annual bake sale is in the lobby
+on Friday from 11 AM to 1 PM."
+
+IMPORTANT IGNORE RULES:
+
+- Mass mailings remain ignore even when they contain
+  words such as "urgent", "important", or "act now".
+
+- A message sent to one person or a small working group
+  is not automatically a mass mailing.
+
+- An automated notice that asks this specific recipient
+  to act is normal, or urgent if it establishes a deadline
+  within two working days.
+
+- A short personal or social message from someone the
+  recipient knows is normal, not ignore.
+
+==================================================
+4. WORKING DAY INTERPRETATION
+==================================================
+
+A working day is Monday to Friday.
+
+Calculate time pressure relative to the email's date,
+not the current date.
+
+Consider weekends when interpreting deadlines.
+
+Use the email's date and context to determine whether
+the deadline falls within two working days.
+
+==================================================
+5. FINAL DECISION PROCEDURE
+==================================================
+
+Apply these steps in order:
+
+1. Is the message advertising, a newsletter, a large-list
+   announcement, or an automated notification requiring
+   no action?
+   If yes, classify as ignore.
+
+2. Is it legitimate work or personal communication intended
+   for this recipient or a small working group?
+   If yes, continue.
+
+3. Does the recipient have an action or responsibility
+   requiring attention within two working days?
+
+4. Is the time pressure explicit or clearly implied by
+   the surrounding context, rather than inferred merely
+   from strong wording or an upcoming event?
+
+5. If both recipient responsibility and near-term time
+   pressure are established, classify as urgent.
+
+6. Otherwise, classify as normal.
+
+When uncertain between urgent and normal, prefer normal
+unless the email provides clear evidence of near-term
+time pressure.
+
+==================================================
+6. OUTPUT FORMAT
+==================================================
+
+Return valid JSON only, with exactly two keys:
+
+{
+    "category": "urgent | normal | ignore",
+    "reason": "One concise sentence explaining the classification."
+}
+
+Output requirements:
+
+- Choose exactly one category.
+- Use lowercase category labels.
+- Provide one concise sentence as the reason.
+- If urgent, mention the action and relevant deadline
+  or time pressure in the reason.
+- Do not include Markdown or code fences.
+- Do not include additional text outside the JSON.
+- Never return multiple categories.
+- Expand abbreviations to their full forms and understand the context.
+"""
+
+    user_prompt = f"""
+Classify the following email using the classification
+rules provided in the system instructions.
+
+Evaluate it from the recipient's perspective at the time
+it was sent.
+
+EMAIL:
+
+To: {email["to"]}
+From: {email["from"]}
+Subject: {email["subject"]}
+Date: {email["date"]}
+
+Body:
+{email["body"]}
+
+Return only the required JSON response.
+"""
+
+    # Exactly one LLM call
+    response = lm(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
+
+    category = "unknown"
+    reason = ""
+
+    # First: Try parsing structured JSON
+    try:
+        parsed = json.loads(response)
+
+        if isinstance(parsed, dict) and "category" in parsed:
+            value = parsed["category"]
+
+            if isinstance(value, str):
+                value = value.strip().lower()
+
+                if value in ("urgent", "normal", "ignore"):
+                    category = value
+
+            reason = str(parsed.get("reason", "")).strip()
+
+        else:
+            raise ValueError("No category field in JSON")
+
+    except (json.JSONDecodeError, ValueError):
+        # Second: Handle plain-text responses.
+        # Extract distinct category labels.
+        labels = set(
+            re.findall(r"\b(urgent|normal|ignore)\b", response, flags=re.IGNORECASE)
+        )
+
+        labels = {label.lower() for label in labels}
+
+        if len(labels) == 1:
+            category = labels.pop()
+
+        reason = response.strip()
+
+    # Always return a non-empty reason
+    if not reason:
+        reason = "The model did not provide a classification reason."
+
+    return {"category": category, "reason": reason}
 
 
 def run_daily_digest(emails: list[Email], lm: LMCallable) -> str:

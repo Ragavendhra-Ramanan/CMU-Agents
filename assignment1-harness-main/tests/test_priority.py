@@ -54,13 +54,17 @@ REPLIES = {
     "refusal": "I'm sorry, I can't help with that.",
     "json_wrong_label": '{"label": "high", "why": "deadline today"}',
     "json_like": '{"category": "urgent", "reason": "deadline today"}',
-    "long_multiline": "Let me think.\n\n" + "The sender wants something. " * 80 + "\n\nFinal: normal",
+    "long_multiline": "Let me think.\n\n"
+    + "The sender wants something. " * 80
+    + "\n\nFinal: normal",
 }
 NO_LABEL = {"garbage", "empty", "whitespace", "refusal", "json_wrong_label"}
 
 
 def check_contract(result, reply: str) -> None:
-    shown = f"The scripted model replied {reply[:80]!r}; run_priority returned {result!r}."
+    shown = (
+        f"The scripted model replied {reply[:80]!r}; run_priority returned {result!r}."
+    )
     assert isinstance(result, dict), f"run_priority should return a dict. {shown}"
     assert "category" in result and "reason" in result, (
         f"The result needs the keys 'category' and 'reason'. {shown}"
@@ -82,7 +86,9 @@ def test_contract_holds_for_any_reply(name, email):
     lm = ScriptedLM([reply], repeat_last=True)
     result = adapters.run_priority(email, lm)
     check_contract(result, reply)
-    assert len(lm.calls) >= 1, "run_priority should call the model at least once; it made no calls."
+    assert len(lm.calls) >= 1, (
+        "run_priority should call the model at least once; it made no calls."
+    )
     if name in NO_LABEL:
         assert result["category"] == "unknown", (
             f"The reply {reply[:60]!r} states no label, so category must be 'unknown', "
@@ -104,8 +110,14 @@ def test_email_is_not_modified():
 def test_live_accuracy(live_lm):
     """Agreement with the gold labels in tests/fixtures/priority_gold.json."""
     gold = eval_slice(load_fixture("priority_gold.json"))
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda item: adapters.run_priority(item["email"], live_lm), gold))
+    import time
+
+    results = []
+
+    for item in gold:
+        result = adapters.run_priority(item["email"], live_lm)
+        results.append(result)
+        time.sleep(3.1)
 
     wrong = []
     unknown = []
@@ -119,7 +131,9 @@ def test_live_accuracy(live_lm):
                 f"subject={item['email']['subject'][:50]!r}"
             )
     correct = len(gold) - len(wrong)
-    print(f"priority accuracy: {correct} of {len(gold)} (run with -s to see this when the test passes)")
+    print(
+        f"priority accuracy: {correct} of {len(gold)} (run with -s to see this when the test passes)"
+    )
     if wrong:
         print("disagreements:\n" + "\n".join(wrong))
     assert not unknown, (
