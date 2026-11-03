@@ -40,7 +40,7 @@ from cs329z_hw1.types import (
     ToolCall,
     ToolSpec,
 )
-
+from concurrent.futures import ThreadPoolExecutor
 # ======================================================================
 # Part 1: LLM pipelines
 # ======================================================================
@@ -377,22 +377,273 @@ Return only the required JSON response.
     return {"category": category, "reason": reason}
 
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from openai import RateLimitError
+
+# Shared across all workers and daily digest jobs.
+_rate_limit_lock = threading.Lock()
+
+_next_request_at = 0.0
+_blocked_until = 0.0
+
+# Stay below the provider's 20 RPM limit.
+MIN_REQUEST_INTERVAL = 3.2
+
+
+def wait_for_request_slot():
+    """Globally space all outgoing LLM requests."""
+
+    global _next_request_at
+
+    with _rate_limit_lock:
+        now = time.monotonic()
+
+        request_time = max(now, _next_request_at, _blocked_until)
+
+        _next_request_at = request_time + MIN_REQUEST_INTERVAL
+
+    wait_time = max(0, request_time - time.monotonic())
+
+    if wait_time > 0:
+        time.sleep(wait_time)
+
+
+def call_with_rate_limit_retry(func, *args, max_attempts=3):
+    """Rate-limit every request and retry transient 429 errors."""
+
+    global _blocked_until
+
+    for attempt in range(max_attempts):
+        # Important: throttle BEFORE the initial call and every retry.
+        wait_for_request_slot()
+
+        try:
+            return func(*args)
+
+        except RateLimitError as exc:
+            if attempt == max_attempts - 1:
+                raise
+
+            headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+
+            retry_after = headers.get("retry-after")
+
+            if retry_after:
+                delay = float(retry_after)
+            else:
+                reset_at = headers.get("x-ratelimit-reset")
+
+                if reset_at:
+                    reset_at = float(reset_at)
+
+                    if reset_at > 1e12:
+                        reset_at /= 1000
+
+                    delay = max(0, reset_at - time.time())
+                else:
+                    delay = 60
+
+            with _rate_limit_lock:
+                _blocked_until = max(_blocked_until, time.monotonic() + delay)
+
+            print(f"Rate limit hit. Pausing new requests for {delay:.1f} seconds.")
+
+    raise RuntimeError("Rate-limit retry attempts exhausted")
+
+
 def run_daily_digest(emails: list[Email], lm: LMCallable) -> str:
     """Problem (daily_digest).
 
-    ``emails`` is a list of emails from one calendar day (UTC date); it may
-    be empty. Return the morning summary as a string.
+    emails contains messages from one calendar day.
 
-    Rules the tests check:
-    * Returns a string for every model reply, and for an empty day.
-    * The function does not modify ``emails``.
-    * Live (tests/fixtures/digest_days.json): the digest is not empty and
-      at most 300 words (``len(digest.split())``) as the model wrote it; for
-      each gold urgent email it contains the name of the company, project or
-      site that email is about; it contains no term listed for the gold
-      ignore emails.
+    Pipeline:
+    1. Classify emails concurrently.
+    2. Remove ignored emails.
+    3. Normalize unknown categories to normal.
+    4. Group emails by thread.
+    5. Consolidate each thread.
+    6. Prioritize urgent threads.
+    7. Generate the final morning digest.
     """
-    raise NotImplementedError
+
+    # --------------------------------------------------
+    # STEP 1: Concurrent email classification
+    # --------------------------------------------------
+
+    email_responses = []
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = pool.map(
+            call_with_rate_limit_retry,
+            [run_priority] * len(emails),
+            emails,
+            [lm] * len(emails),
+        )
+
+        email_responses.extend(responses)
+
+    # --------------------------------------------------
+    # STEP 2: Filter ignored emails and normalize unknown
+    # --------------------------------------------------
+
+    filtered_emails = []
+
+    for email, response in zip(emails, email_responses):
+        category = response.get("category", "unknown")
+
+        if category == "ignore":
+            continue
+
+        if category == "unknown":
+            category = "normal"
+
+        # Avoid modifying the original classification response.
+        normalized_response = {**response, "category": category}
+
+        filtered_emails.append((email, normalized_response))
+
+    # --------------------------------------------------
+    # STEP 3: Group emails by thread
+    # --------------------------------------------------
+
+    thread_groups = {}
+
+    for email, response in filtered_emails:
+        thread_id = email.get("thread_id") or email["id"]
+
+        if thread_id not in thread_groups:
+            thread_groups[thread_id] = []
+
+        thread_groups[thread_id].append((email, response))
+
+    # --------------------------------------------------
+    # STEP 4: Consolidate threads
+    # --------------------------------------------------
+
+    digests = []
+
+    for thread_id, group in thread_groups.items():
+        # Sort emails from oldest to latest.
+        # Sorting the group does not modify the original emails.
+        group.sort(key=lambda x: x[0]["date"])
+
+        # Collect every urgent email in this thread.
+        urgent_emails = [
+            (email, response)
+            for email, response in group
+            if response["category"] == "urgent"
+        ]
+
+        # Determine overall thread priority.
+        thread_category = "urgent" if urgent_emails else "normal"
+
+        thread_digest = f"Thread {thread_id}:\n"
+
+        if urgent_emails:
+            # Preserve all urgent messages.
+            for email, response in urgent_emails:
+                thread_digest += (
+                    f"Category: urgent\n"
+                    f"Subject: {email['subject']}\n"
+                    f"From: {email['from']}\n"
+                    f"Body: {email['body']}\n"
+                    f"Reason: {response['reason']}\n\n"
+                )
+
+        else:
+            # No urgent messages: preserve the latest email.
+            email, response = group[-1]
+
+            thread_category = response["category"]
+
+            thread_digest += (
+                f"Category: {thread_category}\n"
+                f"From: {email['from']}\n"
+                f"Subject: {email['subject']}\n"
+                f"Body: {email['body']}\n"
+                f"Reason: {response['reason']}\n\n"
+            )
+
+        digests.append(
+            {
+                "thread_id": thread_id,
+                "category": thread_category,
+                "content": thread_digest,
+            }
+        )
+
+    # --------------------------------------------------
+    # STEP 5: Prioritize urgent threads
+    # --------------------------------------------------
+
+    ordered_digests = sorted(
+        digests, key=lambda x: x["category"] == "urgent", reverse=True
+    )
+
+    # --------------------------------------------------
+    # STEP 6: Prepare final LLM prompt
+    # --------------------------------------------------
+
+    digest_system_prompt = """
+You are an assistant responsible for generating a daily morning
+email digest.
+
+Your goal is to produce an accurate, concise and useful summary
+of the provided email threads.
+
+Follow these rules strictly:
+
+1. The entire digest MUST contain no more than 200 words.
+   Aim for 170-180 words to leave a safety margin.
+2. Present urgent matters before normal matters.
+3. Include every distinct urgent company, project or site name
+   mentioned in the supplied urgent messages.
+4. Do not omit important names, deadlines, decisions or actions
+   from urgent messages.
+5. Summarize normal threads after urgent matters.
+6. Do not invent information or make unsupported assumptions.
+7. Do not introduce information that is not present in the
+   supplied email threads.
+8. Ignore emails have already been removed.
+9. Use concise bullet points rather than lengthy paragraphs.
+10. Combine related information without losing distinct urgent items.
+11. Avoid repeating information across threads.
+12. If there are no emails to summarize, return a short message
+    indicating that there are no relevant emails for the day.
+"""
+
+    digest_user_prompt = (
+        "Generate the morning digest from the following consolidated email threads.\n\n"
+    )
+
+    for digest in ordered_digests:
+        digest_user_prompt += (
+            f"Thread ID: {digest['thread_id']}\n"
+            f"Category: {digest['category']}\n"
+            f"{digest['content']}\n"
+        )
+
+    digest_user_prompt += (
+        "\nGenerate the final morning digest. "
+        "Prioritize all urgent matters, followed by normal matters. "
+        "Preserve every distinct urgent project, company and site name. "
+        "Do not exceed 200 words."
+    )
+
+    # --------------------------------------------------
+    # STEP 7: Exactly one final LLM call
+    # --------------------------------------------------
+
+    messages = [
+        {"role": "system", "content": digest_system_prompt},
+        {"role": "user", "content": digest_user_prompt},
+    ]
+
+    final_digest = call_with_rate_limit_retry(lm, messages)
+
+    return final_digest
 
 
 def run_bm25_build(docs: list[str]) -> Any:
