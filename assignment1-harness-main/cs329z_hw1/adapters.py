@@ -41,6 +41,8 @@ from cs329z_hw1.types import (
     ToolCall,
     ToolSpec,
 )
+import jsonschema
+
 from concurrent.futures import ThreadPoolExecutor
 # ======================================================================
 # Part 1: LLM pipelines
@@ -834,6 +836,8 @@ def run_email_qa(
 # Part 2: the Cardinal Agent
 # ======================================================================
 
+from .types import ToolResult
+
 
 def run_tool_registry(tools: list[ToolSpec]) -> Any:
     """Problem (tool_registry).
@@ -859,19 +863,107 @@ def run_tool_registry(tools: list[ToolSpec]) -> Any:
       ``fn(**args)``: status "ok", ``content == str(return value)``.
     * The registry keeps working after any of these outcomes.
     """
-    raise NotImplementedError
+
+    class RegisterTools:
+        tools: list[dict]
+
+        def __init__(self, tools: ToolSpec):
+            self.tools = tools
+
+        def schemas(self) -> list[dict]:
+            return [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                }
+                for tool in self.tools
+            ]
+
+        def validate(self, name: str, args) -> ToolResult | None:
+            is_found = False
+            for tool in self.tools:
+                if name == tool.name:
+                    is_found = True
+                    try:
+                        jsonschema.validate(instance=args, schema=tool.parameters)
+                    except jsonschema.ValidationError as e:
+                        return ToolResult(
+                            status="invalid_args",
+                            content=str(e),
+                        )
+                    break
+
+            if not is_found:
+                return ToolResult(
+                    status="unknown_tool", content="Tool not found in the registry"
+                )
+
+        def execute(self, name: str, args: dict) -> ToolResult:
+            validation = self.validate(name, args)
+            if validation:
+                return validation
+            for tool in self.tools:
+                if name == tool.name:
+                    try:
+                        tool_result = tool.fn(**args)
+                    except Exception as e:
+                        return ToolResult(status="tool_error", content=str(e))
+                    break
+            return ToolResult(status="ok", content=str(tool_result))
+
+    registry = RegisterTools(tools)
+    return registry
 
 
 def run_render_tools(schemas: list[dict]) -> str:
-    """Problem (tool_protocol).
+    """Render tool descriptions and instructions for the model."""
 
-    Return the prompt text that describes the tools in ``schemas`` (the
-    output of ``registry.schemas()``) and explains how to call them. The
-    text must contain every tool's name and its parameter names. Live: given
-    this text, the model must write a correct call for at least 18 of the 20
-    requests in tests/fixtures/agent_protocol_requests.json.
-    """
-    raise NotImplementedError
+    tool_prompt = f"""
+You are an AI assistant that can use tools to complete user requests.
+
+## Available tools
+
+The following tools are available. Each tool includes its name,
+description, and parameter schema.
+
+{schemas}
+
+## Tool selection instructions
+
+1. Read the user's request carefully.
+2. Select the tool that best matches the user's request.
+3. Use only the tools listed above.
+4. Follow the tool's parameter schema exactly.
+5. Include all required parameters.
+6. Use the correct data types for every parameter.
+7. Do not invent parameter names or provide unsupported arguments.
+8. Do not guess missing values. If required information is unavailable,
+   ask the user for clarification.
+
+## Tool calling format
+
+When a tool is required, return exactly one tool call using this JSON format:
+
+<tool_call>
+{{
+        "name": "tool_name",
+    "arguments": {{
+            "parameter_name": "parameter_value"
+    }}
+}}
+</tool_call>
+
+## Important constraints
+
+- Call at most one tool per response.
+- Do not call multiple tools.
+- Use the exact registered tool name.
+- Ensure the arguments are valid according to the tool's JSON Schema.
+- Do not include additional text around the JSON tool call.
+- If no tool is needed, respond normally in natural language.
+"""
+    return tool_prompt
 
 
 def run_parse_response(text: str) -> ParsedResponse:
@@ -891,7 +983,46 @@ def run_parse_response(text: str) -> ParsedResponse:
       is exactly the original call, never a different one. If the cut is
       inside the arguments, ``tool_call`` is None and ``error`` is set.
     """
-    raise NotImplementedError
+    correct_tool_call = None
+    error = None
+    if ("<tool_call>" not in text) and ("</tool_call>" not in text):
+        error = None
+    elif "<tool_call>" not in text:
+        error = "Malformed"
+    elif "</tool_call>" not in text:
+        error = " Truncated"
+    else:
+        tool_call_split = text.split("<tool_call>")
+        if len(tool_call_split) > 2:
+            error = "multiple blocks of tool calls"
+        else:
+            tool_calls = tool_call_split[1].split("</tool_call>")
+            if len(tool_calls) > 2:
+                error = "Malformed error"
+            else:
+                text = tool_call_split[0].strip()
+                tool_call = tool_calls[0].strip()
+                try:
+                    data = json.loads(tool_call)
+                    if not isinstance(data, dict):
+                        error = "Malformed tool calls"
+                    elif (
+                        "name" not in data
+                        or not isinstance(data["name"], str)
+                        or len(data["name"].strip()) <= 0
+                    ):
+                        error = "Argument name issue"
+                    elif "arguments" not in data or not isinstance(
+                        data["arguments"], dict
+                    ):
+                        error = "Arguments issue"
+                    else:
+                        correct_tool_call = ToolCall(
+                            name=data["name"], args=data["arguments"]
+                        )
+                except Exception as e:
+                    error = str(e)
+    return ParsedResponse(text=text, tool_call=correct_tool_call, error=error)
 
 
 def run_format_tool_call(text: str, call: ToolCall) -> str:
@@ -910,7 +1041,18 @@ def run_format_tool_call(text: str, call: ToolCall) -> str:
       complete call in your own format.
     * ``call`` is not modified.
     """
-    raise NotImplementedError
+    call_json = (
+        json.dumps({"name": call.name, "arguments": call.args})
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+    return f"""
+    {text.strip()}
+
+    <tool_call>
+    {call_json}
+    </tool_call>
+    """.strip()
 
 
 def run_agent_session(

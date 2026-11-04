@@ -85,7 +85,9 @@ def check_shape(result, search: FakeSearch, context: str) -> None:
 def test_hop_budget_and_shape_for_any_reply(name):
     search = FakeSearch()
     lm = ScriptedLM([REPLIES[name]], repeat_last=True)
-    result = adapters.run_email_qa("Which room did the budget review move to?", search, lm)
+    result = adapters.run_email_qa(
+        "Which room did the budget review move to?", search, lm
+    )
     context = f"Every model call was answered with the {name!r} scripted reply."
     assert len(search.queries) <= HOP_BUDGET, (
         f"search() was called {len(search.queries)} times; the hop budget is {HOP_BUDGET}. {context}"
@@ -97,7 +99,9 @@ def test_hop_budget_and_shape_for_any_reply(name):
 def test_search_returns_nothing(name):
     search = FakeSearch(empty=True)
     lm = ScriptedLM([REPLIES[name]], repeat_last=True)
-    result = adapters.run_email_qa("Which room did the budget review move to?", search, lm)
+    result = adapters.run_email_qa(
+        "Which room did the budget review move to?", search, lm
+    )
     context = f"search() returned no emails and the model replied with the {name!r} scripted reply."
     assert len(search.queries) <= HOP_BUDGET, (
         f"search() was called {len(search.queries)} times; the hop budget is {HOP_BUDGET}. {context}"
@@ -115,11 +119,15 @@ def make_search(archive):
     if "index" not in _cache:
         from cs329z_hw1.data import email_text
 
-        _cache["index"] = adapters.run_bm25_build([email_text(email) for email in archive])
+        _cache["index"] = adapters.run_bm25_build(
+            [email_text(email) for email in archive]
+        )
     index = _cache["index"]
 
     def search(query: str, k: int = 5) -> list[dict]:
-        return [archive[doc_id] for doc_id, _ in adapters.run_bm25_search(index, query, k)]
+        return [
+            archive[doc_id] for doc_id, _ in adapters.run_bm25_search(index, query, k)
+        ]
 
     return search
 
@@ -130,16 +138,25 @@ def live_answers(archive, lm) -> list[tuple[dict, dict]]:
     if "answers" not in _cache:
         items = eval_slice(load_fixture("email_qa.json"))
         search = make_search(archive)
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(
-                pool.map(lambda item: adapters.run_email_qa(item["question"], search, lm), items)
-            )
+
+        import time
+
+        results = []
+
+        for item in items:
+            result = adapters.run_email_qa(item["question"], search, lm)
+            results.append(result)
+            time.sleep(12)
+
         _cache["answers"] = list(zip(items, results))
+
     return _cache["answers"]
 
 
 def is_correct(item: dict, result: dict) -> bool:
-    return isinstance(result.get("answer"), str) and contains_any(result["answer"], item["answers"])
+    return isinstance(result.get("answer"), str) and contains_any(
+        result["answer"], item["answers"]
+    )
 
 
 @pytest.mark.live
@@ -155,13 +172,16 @@ def test_live_accuracy(archive, live_lm):
     correct = len(pairs) - len(wrong)
     for hops in (1, 2):
         subset = [(i, r) for i, r in pairs if i["hops"] == hops]
-        print(f"email_qa {hops}-hop: {sum(is_correct(i, r) for i, r in subset)} of {len(subset)}")
+        print(
+            f"email_qa {hops}-hop: {sum(is_correct(i, r) for i, r in subset)} of {len(subset)}"
+        )
     print(f"email_qa accuracy: {correct} of {len(pairs)}")
     if wrong:
         print("wrong answers:\n" + "\n".join(wrong))
     assert correct / len(pairs) >= EMAIL_QA_MIN_ACCURACY, (
         f"{correct} of {len(pairs)} answers are correct ({correct / len(pairs):.0%}); "
-        f"at least {EMAIL_QA_MIN_ACCURACY:.0%} is required. Wrong answers:\n" + "\n".join(wrong)
+        f"at least {EMAIL_QA_MIN_ACCURACY:.0%} is required. Wrong answers:\n"
+        + "\n".join(wrong)
     )
 
 
@@ -177,10 +197,14 @@ def test_live_support(archive, live_lm):
         for item, result in answered
         if not set(result.get("support") or []) & set(item["support"])
     ]
-    print(f"email_qa support: {len(answered) - len(missing)} of {len(answered)} correct answers cite a gold email")
+    print(
+        f"email_qa support: {len(answered) - len(missing)} of {len(answered)} correct answers cite a gold email"
+    )
     if missing:
         print("missing support:\n" + "\n".join(missing))
-    assert answered, "No question was answered correctly, so there is no support to check."
+    assert answered, (
+        "No question was answered correctly, so there is no support to check."
+    )
     assert not missing, (
         f"{len(missing)} of {len(answered)} correct answers cite no gold email:\n"
         + "\n".join(missing)
