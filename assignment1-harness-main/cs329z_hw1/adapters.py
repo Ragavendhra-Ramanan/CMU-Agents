@@ -26,10 +26,11 @@ of this call.
 """
 
 from __future__ import annotations
-
+from cs329z_hw1.tokenizer import tokenize
 from typing import Any, Callable, Optional
 import json
 import re
+import math
 from cs329z_hw1.types import (
     AgentConfig,
     DocWindow,
@@ -646,6 +647,9 @@ Follow these rules strictly:
     return final_digest
 
 
+from collections import Counter
+
+
 def run_bm25_build(docs: list[str]) -> Any:
     """Problem (bm25).
 
@@ -656,7 +660,32 @@ def run_bm25_build(docs: list[str]) -> Any:
     back to ``run_bm25_search``. The index over the archive must build in
     under 15 seconds.
     """
-    raise NotImplementedError
+    tokenised_docs = [tokenize(doc) for doc in docs]
+    doc_lengths = [len(doc) for doc in tokenised_docs]
+
+    N = len(tokenised_docs)
+    avgdl = sum(doc_lengths) / N if N > 0 else 0
+
+    inverted_index = {}
+    for i, doc in enumerate(tokenised_docs):
+        counter = Counter(doc)
+        for term, freq in counter.items():
+            if term not in inverted_index:
+                inverted_index[term] = []
+            inverted_index[term].append((i, freq))
+
+    doc_freq = {term: len(inverted_index[term]) for term in inverted_index}
+
+    idf_dict = {}
+    for term, df in doc_freq.items():
+        idf_dict[term] = math.log(1 + (N - df + 0.5) / (df + 0.5))
+
+    return {
+        "inverted_index": inverted_index,
+        "idf_dict": idf_dict,
+        "doc_lengths": doc_lengths,
+        "avgdl": avgdl,
+    }
 
 
 def run_bm25_search(index: Any, query: str, k: int) -> list[tuple[int, float]]:
@@ -677,7 +706,29 @@ def run_bm25_search(index: Any, query: str, k: int) -> list[tuple[int, float]]:
       query on average over the archive, and 2 ms for a term that occurs in
       3 of 200,000 documents.
     """
-    raise NotImplementedError
+    query_tokens = set(tokenize(query))
+    if not query_tokens:
+        return []
+    inverted_index = index["inverted_index"]
+    doc_lengths = index["doc_lengths"]
+    idf_dict = index["idf_dict"]
+    avgdl = index["avgdl"]
+    k1 = 1.5
+    b = 0.75
+    scores = {}
+    for token in query_tokens:
+        if token in inverted_index:
+            idf = idf_dict[token]
+            for doc_id, freq in inverted_index[token]:
+                d_bar = doc_lengths[doc_id]
+                score = (
+                    idf * (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * d_bar / avgdl))
+                )
+                if doc_id not in scores:
+                    scores[doc_id] = 0.0
+                scores[doc_id] += score
+    sorted_scores = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+    return sorted_scores[:k]
 
 
 def run_email_qa(
