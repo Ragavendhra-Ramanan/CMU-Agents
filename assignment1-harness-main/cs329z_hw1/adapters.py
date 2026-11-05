@@ -30,7 +30,10 @@ from cs329z_hw1.tokenizer import tokenize
 from typing import Any, Callable, Optional
 import json
 import re
+import copy
+from cs329z_hw1.llm import OutputTruncated
 import math
+from cs329z_hw1.tokens import count_tokens, count_message_tokens
 from cs329z_hw1.types import (
     AgentConfig,
     DocWindow,
@@ -40,6 +43,7 @@ from cs329z_hw1.types import (
     SearchResult,
     ToolCall,
     ToolSpec,
+    AgentResult,
 )
 import jsonschema
 
@@ -865,52 +869,62 @@ def run_tool_registry(tools: list[ToolSpec]) -> Any:
     """
 
     class RegisterTools:
-        tools: list[dict]
+        def __init__(self, tools):
+            self.tools = {tool.name: tool for tool in tools}
+            self.validators = {}
 
-        def __init__(self, tools: ToolSpec):
-            self.tools = tools
+            # Build and validate each JSON Schema only once.
+            for name, tool in self.tools.items():
+                validator_cls = jsonschema.validators.validator_for(tool.parameters)
+                validator_cls.check_schema(tool.parameters)
+                self.validators[name] = validator_cls(tool.parameters)
 
-        def schemas(self) -> list[dict]:
+        def schemas(self):
             return [
                 {
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.parameters,
                 }
-                for tool in self.tools
+                for tool in self.tools.values()
             ]
 
-        def validate(self, name: str, args) -> ToolResult | None:
-            is_found = False
-            for tool in self.tools:
-                if name == tool.name:
-                    is_found = True
-                    try:
-                        jsonschema.validate(instance=args, schema=tool.parameters)
-                    except jsonschema.ValidationError as e:
-                        return ToolResult(
-                            status="invalid_args",
-                            content=str(e),
-                        )
-                    break
-
-            if not is_found:
+        def validate(self, name, args):
+            if name not in self.tools:
                 return ToolResult(
-                    status="unknown_tool", content="Tool not found in the registry"
+                    status="unknown_tool",
+                    content=f"Unknown tool: {name}",
                 )
 
-        def execute(self, name: str, args: dict) -> ToolResult:
-            validation = self.validate(name, args)
-            if validation:
-                return validation
-            for tool in self.tools:
-                if name == tool.name:
-                    try:
-                        tool_result = tool.fn(**args)
-                    except Exception as e:
-                        return ToolResult(status="tool_error", content=str(e))
-                    break
-            return ToolResult(status="ok", content=str(tool_result))
+            try:
+                self.validators[name].validate(args)
+            except jsonschema.ValidationError as e:
+                return ToolResult(
+                    status="invalid_args",
+                    content=str(e),
+                )
+
+            return None
+
+        def execute(self, name, args):
+            validation_result = self.validate(name, args)
+
+            if validation_result is not None:
+                return validation_result
+
+            tool = self.tools[name]
+
+            try:
+                result = tool.fn(**args)
+                return ToolResult(
+                    status="ok",
+                    content=str(result),
+                )
+            except Exception as e:
+                return ToolResult(
+                    status="tool_error",
+                    content=str(e),
+                )
 
     registry = RegisterTools(tools)
     return registry
@@ -1168,7 +1182,145 @@ def run_agent_session(
     * Nothing in a tool result changes the mode, the approval policy or
       the deny rules.
     """
-    raise NotImplementedError
+
+    class AgentSession:
+        def __init__(self, lm, tools, config):
+            self.lm = lm
+            self.config = config
+            self.mode = config.mode
+            self.registry = run_tool_registry(tools)
+            self.transcript = []
+            self.messages = [
+                {"role": "system", "content": run_render_tools(self.registry.schemas())}
+            ]
+
+        def set_mode(self, mode):
+            if mode not in ("confirm", "auto"):
+                raise ValueError(f"Invalid mode: {mode}")
+
+            self.mode = mode
+
+        def send(self, user_message):
+            self.messages.append({"role": "user", "content": user_message})
+            self.transcript.append({"type": "user", "content": user_message})
+            malformed_count = 0
+            total_tokens = 0
+            response = ""
+            turn_count = 0
+            while True:
+                if turn_count >= self.config.max_turns:
+                    return AgentResult(
+                        text="Maximum model turns reached.",
+                        status="max_turns",
+                        transcript=copy.deepcopy(self.transcript),
+                    )
+                if malformed_count >= 3:
+                    return AgentResult(
+                        text=" Max Turn Exhausted",
+                        status="malformed",
+                        transcript=copy.deepcopy(self.transcript),
+                    )
+                if total_tokens >= self.config.token_budget:
+                    return AgentResult(
+                        text="Token budget exhausted.",
+                        status="token_budget",
+                        transcript=copy.deepcopy(self.transcript),
+                    )
+                try:
+                    turn_count += 1
+                    response = self.lm(self.messages)
+                    total_tokens += count_message_tokens(self.messages) + count_tokens(
+                        response
+                    )
+                except OutputTruncated as e:
+                    self.transcript.append({"type": "error", "content": str(e)})
+                    self.messages.append({"role": "assistant", "content": str(e)})
+                    malformed_count += 1
+                    continue
+                parsed = run_parse_response(response)
+
+                # Record the raw model response
+                self.transcript.append(
+                    {
+                        "type": "assistant",
+                        "content": response,
+                    }
+                )
+
+                # Branch 1: Malformed model response
+                if parsed.error:
+                    malformed_count += 1
+                    self.transcript.append(
+                        {
+                            "type": "error",
+                            "content": parsed.error,
+                        }
+                    )
+
+                    self.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": parsed.error,
+                        }
+                    )
+
+                # Branch 2: Model requested a tool
+                elif parsed.tool_call:
+                    name = parsed.tool_call.name
+                    args = parsed.tool_call.args
+
+                    self.transcript.append(
+                        {
+                            "type": "tool_call",
+                            "name": name,
+                            "args": args,
+                        }
+                    )
+
+                    tool_result: ToolResult = self.registry.execute(name, args)
+
+                    self.transcript.append(
+                        {
+                            "type": "tool_result",
+                            "name": name,
+                            "status": tool_result.status,
+                            "content": tool_result.content,
+                        }
+                    )
+
+                    self.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": (
+                                f"Tool Name: {name}\n"
+                                f"Status: {tool_result.status}\n"
+                                f"Tool Content: {tool_result.content}"
+                            ),
+                        }
+                    )
+                    if tool_result.status in ["unknown_tool", "invalid_args"]:
+                        malformed_count += 1
+                    else:
+                        malformed_count = 0
+
+                # Branch 3: Model returned its final answer
+                else:
+                    answer = parsed.text or "I couldn't produce an answer."
+
+                    self.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": answer,
+                        }
+                    )
+
+                    return AgentResult(
+                        text=answer,
+                        status="done",
+                        transcript=copy.deepcopy(self.transcript),
+                    )
+
+    return AgentSession(lm, tools, config)
 
 
 def run_build_doc_index(docs: list[dict]) -> Any:
